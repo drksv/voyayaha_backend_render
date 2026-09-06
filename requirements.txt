@@ -1,0 +1,22 @@
+fastapi
+uvicorn[standard]
+torch
+python-dotenv
+httpx
+pydantic
+beautifulsoup4   # optional future parsing
+transformers
+requests
+praw
+openai
+typing
+aiohttp
+datetime
+flask
+flask-cors
+gunicorn
+pymysql
+
+
+
+
