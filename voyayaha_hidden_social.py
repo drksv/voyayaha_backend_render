@@ -15,9 +15,9 @@ REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT")
 API_BASE = os.getenv("API_BASE", "https://backend-eqzz.onrender.com").rstrip("/")
 
-_reddit = None
+_reddit_client = None
 if all([REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT]):
-    _reddit = praw.Reddit(
+    _reddit_client = praw.Reddit(
         client_id=REDDIT_CLIENT_ID,
         client_secret=REDDIT_CLIENT_SECRET,
         user_agent=REDDIT_USER_AGENT,
@@ -29,11 +29,11 @@ def _proxify(url: str | None):
 
 
 async def _reddit(query: str, limit: int):
-    if not _reddit:
+    if not _reddit_client:
         return []
     results = []
     try:
-        for post in _reddit.subreddit("travel").search(query, limit=limit, sort="relevance"):
+        for post in _reddit_client.subreddit("travel").search(query, limit=limit, sort="relevance"):
             image = None
             if hasattr(post, "preview"):
                 images = post.preview.get("images", [])
