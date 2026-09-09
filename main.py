@@ -21,7 +21,7 @@ from weather_openmeteo import get_weather_16_days, get_lat_lon_from_city, get_aq
 from traveler_advice import build_traveler_advice
 from traffic_tomtom import get_traffic_status
 from social import get_youtube_posts, get_reddit_posts
-from voyayaha_hidden_llm import generate_hidden_itinerary
+from voyayaha_hidden_llm import generate_hidden_itinerary, rank_social_hidden_places
 from voyayaha_hidden_social import get_hidden_social
 
 load_dotenv()
@@ -236,19 +236,47 @@ async def chat(data: ChatRequest):
 
 # ---------- hidden ----------
 @app.get("/chat/experiences-hidden")
-async def hidden_experiences(location: str, query: str = "", limit: int = Query(3, ge=1, le=10)):
-    results = await _safe_await(
-        __import__("asyncio").to_thread(generate_hidden_itinerary, location, query, limit), []
+async def hidden_experiences(location: str, query: str = "", limit: int = Query(3, ge=1, le=3)):
+    # 1) Search LIVE Reddit + YouTube. 2) Give that evidence to the LLM.
+    # 3) Return the three AI-selected places with source links.
+    social_results = await _safe_await(get_hidden_social(location, query, 6), [])
+    ai_results = await _safe_await(
+        __import__("asyncio").to_thread(rank_social_hidden_places, location, query, social_results, limit), []
     )
-    return {"stops": results if isinstance(results, list) else []}
+    # If the AI provider is temporarily unavailable, keep useful social results
+    # instead of returning a 500/blank page.
+    if not ai_results:
+        ai_results = [
+            {
+                "name": x.get("title", "Social travel discovery"),
+                "description": x.get("description", ""),
+                "tip": "Open the community/video source to verify the place before travelling.",
+                "category": "Trending from " + str(x.get("source", "social")).title(),
+                "source": x.get("source", "social"),
+                "source_url": x.get("url"),
+                "image": x.get("image"),
+                "evidence": x.get("title", ""),
+            }
+            for x in social_results[:limit]
+        ]
+    return {
+        "stops": ai_results[:limit],
+        "places": ai_results[:limit],
+        "results": ai_results[:limit],
+        "sources": {"reddit": sum(1 for x in social_results if x.get("source") == "reddit"), "youtube": sum(1 for x in social_results if x.get("source") == "youtube")},
+        "ai_ranked": bool(ai_results and social_results),
+        "location": location,
+        "query": query,
+    }
 
 @app.get("/hidden-experiences")
-async def hidden_experiences_alias(location: str, query: str = "", limit: int = Query(3, ge=1, le=10)):
+async def hidden_experiences_alias(location: str, query: str = "", limit: int = Query(3, ge=1, le=3)):
     return await hidden_experiences(location, query, limit)
 
 @app.get("/social-hidden")
-async def social_hidden(location: str = "Mumbai", query: str = "", limit: int = Query(3, ge=1, le=10)):
-    return await _safe_await(get_hidden_social(location, query, limit), [])
+async def social_hidden(location: str = "Mumbai", query: str = "", limit: int = Query(6, ge=1, le=10)):
+    results = await _safe_await(get_hidden_social(location, query, limit), [])
+    return {"results": results, "places": results, "youtube": [x for x in results if x.get("source") == "youtube"], "reddit": [x for x in results if x.get("source") == "reddit"]}
 
 # ---------- experiences / village ----------
 @app.get("/experiences")
