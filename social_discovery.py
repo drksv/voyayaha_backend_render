@@ -212,24 +212,53 @@ async def _youtube_search(query: str, limit: int = 10, order: str = "relevance")
 
 
 async def _geocode(name: str, city: str) -> tuple[float | None, float | None]:
-    # Open-Meteo first, Nominatim second. Neither requires another paid API key.
+    """Geocode a candidate place without requiring a paid maps API.
+
+    We try several increasingly broad queries because landmarks such as
+    "Marine Drive" or "Devkund" often do not resolve when the city is
+    appended as one long Open-Meteo name query.
+    """
+    queries = [
+        f"{name}, {city}, India",
+        f"{name}, {city}",
+        f"{name}, India",
+        name,
+    ]
+
+    # Open-Meteo is fast and free. Try each query and keep the first useful hit.
     try:
-        lat, lon = await asyncio.to_thread(get_lat_lon_from_city, f"{name}, {city}")
-        if lat is not None and lon is not None:
-            return float(lat), float(lon)
+        async with httpx.AsyncClient(timeout=10) as client:
+            for q in queries:
+                r = await client.get(
+                    "https://geocoding-api.open-meteo.com/v1/search",
+                    params={"name": q, "count": 5, "language": "en", "format": "json"},
+                )
+                if not r.is_success:
+                    continue
+                for row in r.json().get("results", []):
+                    lat, lon = row.get("latitude"), row.get("longitude")
+                    if lat is None or lon is None:
+                        continue
+                    # Prefer a result in the requested city/country when the API provides metadata.
+                    country = str(row.get("country_code", "")).lower()
+                    if country in {"in", "india"} or city.lower() in str(row).lower():
+                        return float(lat), float(lon)
     except Exception:
         pass
 
+    # Nominatim is the fallback. Keep the request count low and use a descriptive user agent.
     try:
-        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Voyayaha/1.0 travel discovery"}) as client:
-            r = await client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": f"{name}, {city}", "format": "json", "limit": 1},
-            )
-            r.raise_for_status()
-            rows = r.json()
-            if rows:
-                return float(rows[0]["lat"]), float(rows[0]["lon"])
+        async with httpx.AsyncClient(timeout=12, headers={"User-Agent": "Voyayaha/1.0 (travel discovery)"}) as client:
+            for q in queries[:3]:
+                r = await client.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": q, "format": "json", "limit": 3, "countrycodes": "in"},
+                )
+                if not r.is_success:
+                    continue
+                rows = r.json()
+                if rows:
+                    return float(rows[0]["lat"]), float(rows[0]["lon"])
     except Exception as exc:
         print("Candidate geocoding error:", name, repr(exc))
     return None, None
@@ -262,10 +291,14 @@ Main city: {city}
 User request: {interest}
 
 Analyze the supplied REAL Reddit and YouTube search evidence. Your job is to
-identify actual places mentioned in that evidence. Do NOT invent destinations.
+identify actual places mentioned in the evidence, not the social posts themselves.
+Do NOT invent destinations. Do NOT return a city name, subreddit, channel name,
+year, generic phrase such as "top places", or the title of a video as a place.
 Merge spelling variants and aliases of the same place into one candidate.
-Prefer places that match the user's intent (especially hidden/offbeat/village
-requests) over generic famous attractions.
+Prefer specific landmarks, villages, beaches, waterfalls, trails, temples,
+viewpoints or neighbourhoods that match the user's intent.
+A candidate is valid only when the supplied title/description/comment text gives
+reasonable evidence that the place itself is being discussed.
 
 Return ONLY JSON with this schema:
 [
@@ -295,21 +328,48 @@ SOURCE MATERIAL:
         return []
 
 
-def _fallback_candidates(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # No-LLM fallback. It is deliberately conservative: it uses only likely
-    # proper-name phrases from source titles and never pretends certainty.
-    names: list[str] = []
-    for item in sources:
-        title = _clean_text(item.get("title", ""), 250)
-        cleaned = re.sub(
-            r"^(best|top|hidden|offbeat|places?|things to do|travel|visit|guide)\b[:\- ]*",
-            "",
-            title,
-            flags=re.I,
-        ).strip()
-        if 2 <= len(cleaned.split()) <= 8:
-            names.append(cleaned)
-    return [{"name": n, "source_indexes": [], "evidence": "Found in social travel search results.", "themes": [], "confidence": 0.35} for n in list(dict.fromkeys(names))[:12]]
+def _fallback_candidates(sources: list[dict[str, Any]], city: str = "") -> list[dict[str, Any]]:
+    """Extract conservative place-name candidates when the LLM is unavailable.
+
+    This intentionally works from source text only. It does not invent places.
+    """
+    stop = {
+        "top", "best", "hidden", "peaceful", "places", "place", "visit",
+        "travel", "guide", "india", "mumbai", "pune", "thane", "weekend",
+        "nature", "secret", "beautiful", "tourist", "tourism", "video",
+        "shorts", "official", "2026", "2025", "2024", "near", "and", "the",
+    }
+    candidates: dict[str, dict[str, Any]] = {}
+    for idx, item in enumerate(sources):
+        text = " ".join([
+            str(item.get("title", "")),
+            str(item.get("description", "")),
+            " ".join(item.get("comments", [])[:5]) if isinstance(item.get("comments"), list) else "",
+        ])
+        # Capitalized multi-word names, e.g. "Marine Drive", "Colaba Causeway".
+        phrases = re.findall(r"\b[A-Z][A-Za-z'&.-]*(?:\s+[A-Z][A-Za-z'&.-]*){0,3}\b", text)
+        for phrase in phrases:
+            name = re.sub(r"\s+", " ", phrase).strip(" .,:;|-/")
+            words = name.split()
+            if not 1 <= len(words) <= 4:
+                continue
+            if all(w.lower().strip(".,") in stop for w in words):
+                continue
+            if name.lower() in {city.lower(), "reddit", "youtube"}:
+                continue
+            key = re.sub(r"[^a-z0-9]", "", name.lower())
+            if len(key) < 4:
+                continue
+            row = candidates.setdefault(key, {
+                "name": name, "source_indexes": [], "evidence": "", "themes": [], "confidence": 0.35
+            })
+            if idx not in row["source_indexes"]:
+                row["source_indexes"].append(idx)
+    rows = list(candidates.values())
+    rows.sort(key=lambda x: len(x["source_indexes"]), reverse=True)
+    for row in rows:
+        row["evidence"] = f"Mentioned in {len(row['source_indexes'])} traveller source(s)."
+    return rows[:15]
 
 
 async def _synthesize_ranked_places(
@@ -337,7 +397,7 @@ async def _synthesize_ranked_places(
                 "themes": c.get("themes", []),
                 "evidence": c.get("evidence", ""),
                 "sources": [
-                    {"source": x.get("source"), "title": x.get("title"), "description": x.get("description", "")[:500]}
+                    {"source": x.get("source"), "title": x.get("title"), "description": x.get("description", "")[:700], "comments": x.get("comments", [])[:3]}
                     for x in matched[:8]
                 ],
             }
@@ -399,12 +459,20 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
         f"{interest} near {location}",
         f"{interest} {location} travel",
         f"{interest} {location} weekend",
+        f"hidden offbeat places {location}",
+        f"peaceful places {location}",
+        f"lesser known places {location}",
     ]
-    reddit_tasks = [_reddit_search(q, 10, "relevance") for q in searches[:2]]
+    # More search variants improve place recall. We keep the final UI limited to
+    # exactly three verified places, but the research stage can inspect many sources.
+    reddit_tasks = [_reddit_search(q, 10, "relevance") for q in searches[:4]]
     youtube_tasks = [
         _youtube_search(searches[0], 10, "relevance"),
-        _youtube_search(searches[1], 8, "date"),
-        _youtube_search(searches[2], 8, "viewCount"),
+        _youtube_search(searches[1], 10, "date"),
+        _youtube_search(searches[2], 10, "viewCount"),
+        _youtube_search(searches[3], 10, "relevance"),
+        _youtube_search(searches[4], 10, "date"),
+        _youtube_search(searches[5], 10, "viewCount"),
     ]
     reddit_sets, youtube_sets = await asyncio.gather(asyncio.gather(*reddit_tasks), asyncio.gather(*youtube_tasks))
 
@@ -418,8 +486,20 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
                 sources.append(row)
 
     candidates = await _extract_candidates(location, interest, sources, 15)
-    if not candidates:
-        candidates = _fallback_candidates(sources)
+    # Keep the LLM extraction as the preferred source, but supplement it with
+    # conservative source-text extraction when it found too few candidates.
+    # This prevents a single weak LLM response from turning a rich social search
+    # into one or zero recommendations.
+    fallback_candidates = _fallback_candidates(sources, location)
+    if len(candidates) < 8:
+        existing = {re.sub(r"[^a-z0-9]", "", str(x.get("name", "")).lower()) for x in candidates if isinstance(x, dict)}
+        for extra in fallback_candidates:
+            key = re.sub(r"[^a-z0-9]", "", str(extra.get("name", "")).lower())
+            if key and key not in existing:
+                candidates.append(extra)
+                existing.add(key)
+            if len(candidates) >= 15:
+                break
 
     prepared: list[dict[str, Any]] = []
     sem = asyncio.Semaphore(3)
@@ -511,6 +591,8 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
         final.append({
             **base,
             "rank": len(final) + 1,
+            "score": base["social_score"],
+            "reason": _clean_text(item.get("why_selected", ""), 500) or base["evidence"],
             "summary": _clean_text(item.get("summary", ""), 900) or base["evidence"],
             "why_selected": _clean_text(item.get("why_selected", ""), 500),
             "traveller_signals": item.get("traveller_signals", []) if isinstance(item.get("traveller_signals"), list) else [],
@@ -519,13 +601,41 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
             "ai_confidence": float(item.get("confidence", base["confidence"]) or base["confidence"]),
         })
 
-    # If Groq is unavailable, still return the deterministic top candidates with
-    # transparent wording. This keeps the feature useful without pretending AI synthesized it.
+    # If the LLM returns fewer than three selections, fill the remaining slots
+    # from the already-ranked, geographically verified candidates. The final UI
+    # can therefore consistently show three places whenever three candidates
+    # were successfully verified.
+    if len(final) < limit:
+        for base in ranked_candidates:
+            if len(final) >= limit:
+                break
+            key = re.sub(r"[^a-z0-9]", "", base["name"].lower())
+            if key in used:
+                continue
+            used.add(key)
+            final.append({
+                **base,
+                "rank": len(final) + 1,
+                "score": base["social_score"],
+                "reason": "Strong social evidence and verified distance within the requested radius.",
+                "summary": base["evidence"] or "Found in traveller social sources.",
+                "why_selected": "Strong social evidence and verified distance within the requested radius.",
+                "traveller_signals": [],
+                "best_for": interest,
+                "caveat": "This place was ranked from the verified social evidence; AI synthesis was not available for this card.",
+                "ai_confidence": base["confidence"],
+            })
+
+    # If Groq is unavailable, the deterministic cards above still remain useful
+    # and transparent. They are never presented as an AI summary unless one was
+    # actually generated.
     if not final:
         for base in ranked_candidates[:limit]:
             final.append({
                 **base,
                 "rank": len(final) + 1,
+                "score": base["social_score"],
+                "reason": "Strong social evidence and verified distance within the requested radius.",
                 "summary": base["evidence"] or "Found in traveller social sources.",
                 "why_selected": "Strongest available social and geographic evidence.",
                 "traveller_signals": [],
