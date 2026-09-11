@@ -228,7 +228,7 @@ async def api_itinerary(data: ItineraryRequest):
 async def chat(data: ChatRequest):
     prompt = data.prompt or data.message or (data.messages[-1].content if data.messages else "")
     req = ExperienceRequest(
-        location=data.location or "India",
+        location=data.location or "",
         budget=data.budget, activity=data.activity,
         duration=data.duration, motivation=prompt or data.motivation,
         num_days=data.num_days,
@@ -256,7 +256,7 @@ async def social_discovery_health():
     """Non-secret deployment check for the Hidden Places discovery service."""
     from social_discovery import _configuration_status
     return {
-        "discovery_version": "3.0-place-gated",
+        "discovery_version": "3.1-global-place-gated",
         "configuration": _configuration_status(),
         "message": "Keys are never returned; booleans only show whether the required environment variables are present.",
     }

@@ -92,8 +92,8 @@ async def _reddit_search(query: str, limit: int = 12, sort: str = "relevance") -
     def run() -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         try:
-            # Search across Reddit, not just r/travel. This is important for
-            # regional Indian travel questions where local subreddits are more useful.
+            # Search across Reddit, not just r/travel. This keeps discovery global
+            # and lets the requested city/region determine the geography.
             for post in reddit.subreddit("all").search(query, limit=limit, sort=sort, time_filter="year"):
                 body = _clean_text(getattr(post, "selftext", ""), 1400)
                 comments: list[str] = []
@@ -226,10 +226,11 @@ async def _geocode(name: str, city: str) -> tuple[float | None, float | None, di
     returned by geocoders as business/locality names. We therefore keep the
     geocoder class/type/feature code and apply a second deterministic place gate.
     """
+    # IMPORTANT: this service is global. Do not append India or restrict
+    # Nominatim/Open-Meteo to India; the user's requested city is the geography.
     queries = [
-        f"{name}, {city}, Maharashtra, India" if city.lower() in {"mumbai", "pune", "thane", "nashik", "nagpur"} else f"{name}, {city}, India",
-        f"{name}, {city}, India",
         f"{name}, {city}",
+        name,
     ]
     city_lat, city_lon = await asyncio.to_thread(get_lat_lon_from_city, city)
 
@@ -241,7 +242,7 @@ async def _geocode(name: str, city: str) -> tuple[float | None, float | None, di
             for q in queries:
                 r = await client.get(
                     "https://nominatim.openstreetmap.org/search",
-                    params={"q": q, "format": "json", "limit": 8, "countrycodes": "in", "addressdetails": 1},
+                    params={"q": q, "format": "json", "limit": 8, "addressdetails": 1},
                 )
                 if not r.is_success:
                     continue
@@ -288,9 +289,6 @@ async def _geocode(name: str, city: str) -> tuple[float | None, float | None, di
                 for row in r.json().get("results", []):
                     lat, lon = row.get("latitude"), row.get("longitude")
                     if lat is None or lon is None:
-                        continue
-                    country = str(row.get("country_code", row.get("country", ""))).lower()
-                    if country not in {"in", "india"} and "india" not in str(row).lower():
                         continue
                     returned_name = str(row.get("name", ""))
                     feature = str(row.get("feature_code", "")).upper()
@@ -519,7 +517,7 @@ def _fallback_candidates(sources: list[dict[str, Any]], city: str = "") -> list[
         "what", "why", "where", "when", "which", "who", "how", "please",
         "help", "thanks", "thank", "hello", "hi", "hey", "anyone", "someone",
         "recommend", "recommendations", "suggestion", "suggestions", "advice",
-        "travel", "guide", "india", "mumbai", "pune", "thane", "weekend",
+        "travel", "guide", "weekend",
         "nature", "secret", "beautiful", "tourist", "tourism", "video",
         "shorts", "official", "2026", "2025", "2024", "near", "and", "the",
     }
@@ -632,7 +630,7 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
     center_lat, center_lon = await asyncio.to_thread(get_lat_lon_from_city, location)
     if center_lat is None or center_lon is None:
         return {
-            "discovery_version": "3.0-place-gated",
+            "discovery_version": "3.1-global-place-gated",
             "location": location,
             "radius_km": radius_km,
             "results": [],
@@ -883,7 +881,7 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
         message = "Social recommendations verified."
 
     return {
-        "discovery_version": "3.0-place-gated",
+        "discovery_version": "3.1-global-place-gated",
         "location": location,
         "center": {"latitude": float(center_lat), "longitude": float(center_lon)},
         "radius_km": radius_km,
