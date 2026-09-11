@@ -295,6 +295,73 @@ async def _geocode(name: str, city: str) -> tuple[float | None, float | None]:
     return None, None
 
 
+# Words that frequently get mistaken for place names when an LLM or a
+# title parser extracts capitalized text from conversational content. These are
+# never accepted as destinations, even if a geocoder happens to find an unrelated
+# geographic feature with the same name.
+GENERIC_NON_PLACE_NAMES = {
+    "what", "why", "where", "when", "which", "who", "how", "please",
+    "help", "thanks", "thank", "hello", "hi", "hey", "anyone", "someone",
+    "people", "person", "guys", "everyone", "recommend", "recommendations",
+    "suggestion", "suggestions", "advice", "question", "questions", "guide",
+    "travel", "travelling", "traveling", "trip", "trips", "weekend", "places",
+    "place", "destination", "destinations", "things", "thing", "visit", "visiting",
+    "tour", "tourism", "tourist", "tourists", "india", "maharashtra", "mumbai",
+    "pune", "thane", "navi", "youtube", "reddit", "video", "videos", "shorts",
+    "best", "top", "hidden", "secret", "peaceful", "quiet", "beautiful", "amazing",
+    "awesome", "good", "great", "near", "around", "from", "with", "without", "the",
+    "this", "that", "these", "those", "here", "there", "today", "tomorrow", "yesterday",
+    "2024", "2025", "2026", "2027", "official", "channel", "comment", "comments",
+}
+
+
+def _is_obviously_not_a_place(name: str, city: str = "") -> bool:
+    normalized = re.sub(r"[^a-z0-9 ]", " ", str(name or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return True
+    if normalized == city.lower().strip():
+        return True
+    words = normalized.split()
+    # Single conversational/generic words are the most common false positives.
+    if len(words) == 1 and words[0] in GENERIC_NON_PLACE_NAMES:
+        return True
+    # Reject names made entirely from generic conversational words.
+    if all(w in GENERIC_NON_PLACE_NAMES for w in words):
+        return True
+    # Questions and sentence fragments should never become destination names.
+    if normalized.endswith((" what", " why", " where", " when", " please")):
+        return True
+    if normalized.startswith(("what ", "why ", "where ", "when ", "which ", "please ", "help ")):
+        return True
+    return False
+
+
+def _candidate_has_place_evidence(name: str, source_indexes: list[Any], sources: list[dict[str, Any]]) -> bool:
+    """Require the exact candidate to occur in actual source text.
+
+    This is deliberately deterministic: the model may propose candidates, but
+    it cannot manufacture the evidence that makes a candidate valid.
+    """
+    if not source_indexes:
+        return False
+    name_norm = re.sub(r"\s+", " ", str(name or "").lower()).strip()
+    if len(name_norm) < 3:
+        return False
+    for idx in source_indexes:
+        if not isinstance(idx, int) or idx < 0 or idx >= len(sources):
+            continue
+        src = sources[idx]
+        text = " ".join([
+            str(src.get("title", "")),
+            str(src.get("description", "")),
+            " ".join(src.get("comments", []) if isinstance(src.get("comments"), list) else []),
+        ]).lower()
+        if name_norm in re.sub(r"\s+", " ", text):
+            return True
+    return False
+
+
 async def _extract_candidates(city: str, interest: str, sources: list[dict[str, Any]], limit: int = 15) -> list[dict[str, Any]]:
     if not sources:
         return []
@@ -342,7 +409,13 @@ Return ONLY JSON with this schema:
   }}
 ]
 Return up to {limit} candidates. Every candidate MUST have at least one valid
-source index. Never create a candidate merely because you know it from memory.
+source index. The candidate name MUST be an actual geographic destination or
+landmark. NEVER return conversational words such as "What", "Please", "Why",
+"Where", "How", "Help", "Thanks", "Best", "Places", "Travel", or a sentence
+fragment. NEVER turn a question word or generic travel phrase into a place.
+A one-word place name is allowed only when that exact name appears in the supplied
+source title/description/comment and clearly refers to a destination or landmark.
+Never create a candidate merely because you know it from memory.
 
 SOURCE MATERIAL:
 {json.dumps(compact, ensure_ascii=False)}
@@ -353,7 +426,22 @@ SOURCE MATERIAL:
         parsed = _extract_json(raw)
         if not isinstance(parsed, list):
             return []
-        return [x for x in parsed if isinstance(x, dict)][:limit]
+        clean = []
+        for x in parsed:
+            if not isinstance(x, dict):
+                continue
+            name = _clean_text(x.get("name", ""), 180)
+            if _is_obviously_not_a_place(name, city):
+                continue
+            idxs = x.get("source_indexes") if isinstance(x.get("source_indexes"), list) else []
+            if not _candidate_has_place_evidence(name, idxs, sources):
+                continue
+            x["name"] = name
+            x["source_indexes"] = [i for i in idxs if isinstance(i, int) and 0 <= i < len(sources)]
+            clean.append(x)
+            if len(clean) >= limit:
+                break
+        return clean
     except Exception as exc:
         print("Social candidate extraction error:", repr(exc))
         return []
@@ -366,6 +454,9 @@ def _fallback_candidates(sources: list[dict[str, Any]], city: str = "") -> list[
     """
     stop = {
         "top", "best", "hidden", "peaceful", "places", "place", "visit",
+        "what", "why", "where", "when", "which", "who", "how", "please",
+        "help", "thanks", "thank", "hello", "hi", "hey", "anyone", "someone",
+        "recommend", "recommendations", "suggestion", "suggestions", "advice",
         "travel", "guide", "india", "mumbai", "pune", "thane", "weekend",
         "nature", "secret", "beautiful", "tourist", "tourism", "video",
         "shorts", "official", "2026", "2025", "2024", "near", "and", "the",
@@ -385,6 +476,8 @@ def _fallback_candidates(sources: list[dict[str, Any]], city: str = "") -> list[
             if not 1 <= len(words) <= 4:
                 continue
             if all(w.lower().strip(".,") in stop for w in words):
+                continue
+            if _is_obviously_not_a_place(name, city):
                 continue
             if name.lower() in {city.lower(), "reddit", "youtube"}:
                 continue
@@ -555,7 +648,10 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
 
     async def prepare(candidate: dict[str, Any]) -> dict[str, Any] | None:
         name = _clean_text(candidate.get("name", ""), 180)
-        if len(name) < 3:
+        if len(name) < 3 or _is_obviously_not_a_place(name, location):
+            return None
+        idxs0 = candidate.get("source_indexes") if isinstance(candidate.get("source_indexes"), list) else []
+        if not _candidate_has_place_evidence(name, idxs0, sources):
             return None
         async with sem:
             lat, lon = await _geocode(name, location)
