@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 from llm import generate_itinerary
 from weather_openmeteo import get_lat_lon_from_city
+from supabase_places import search_curated_places, configuration_status as supabase_configuration_status
 
 load_dotenv()
 
@@ -30,6 +31,7 @@ def _configuration_status() -> dict[str, bool]:
         "youtube_api": bool(YOUTUBE_API_KEY),
         "reddit_api": bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET),
         "groq": bool(os.getenv("VY_GROQ_API_KEY") or os.getenv("GROQ_API_KEY")),
+        "supabase": bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY")),
     }
 
 reddit = None
@@ -630,7 +632,7 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
     center_lat, center_lon = await asyncio.to_thread(get_lat_lon_from_city, location)
     if center_lat is None or center_lon is None:
         return {
-            "discovery_version": "3.1-global-place-gated",
+            "discovery_version": "3.2-global-place-gated-db",
             "location": location,
             "radius_km": radius_km,
             "results": [],
@@ -862,6 +864,65 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
                 "ai_confidence": base["confidence"],
             })
 
+    # SECONDARY SOURCE: fill any missing slots from the Voyayaha curated database.
+    # Social discovery above always keeps priority. Database cards are only added
+    # after the strongest social cards have been selected.
+    database_results = []
+    if len(final) < limit:
+        try:
+            database_results = await search_curated_places(
+                location, query or interest, radius_km, limit - len(final),
+                center=(float(center_lat), float(center_lon)),
+            )
+        except Exception as exc:
+            print("Curated database fallback error:", repr(exc))
+            database_results = []
+
+        used_names = {re.sub(r"[^a-z0-9]", "", str(x.get("name", "")).lower()) for x in final}
+        for db in database_results:
+            if len(final) >= limit:
+                break
+            key = re.sub(r"[^a-z0-9]", "", str(db.get("name", "")).lower())
+            if not key or key in used_names:
+                continue
+            used_names.add(key)
+            source_url = db.get("source_url") or "https://voyayaha.com"
+            final.append({
+                "rank": len(final) + 1,
+                "name": db.get("name"),
+                "latitude": db.get("latitude"),
+                "longitude": db.get("longitude"),
+                "distance_km": db.get("distance_km"),
+                "social_score": 0,
+                "score": db.get("database_score", 0),
+                "reason": "Curated from the Voyayaha place database after social discovery did not fill all recommendation slots.",
+                "summary": db.get("description") or "A verified place curated by Voyayaha.",
+                "why_selected": "Added from Voyayaha's curated place database as a secondary recommendation.",
+                "traveller_signals": [],
+                "best_for": db.get("best_for") or interest,
+                "caveat": "Curated by Voyayaha; this card is not ranked from current Reddit or YouTube evidence.",
+                "ai_confidence": 1.0,
+                "reddit_mentions": 0,
+                "youtube_mentions": 0,
+                "reddit": [],
+                "youtube": [],
+                "sources": [{
+                    "source": "voyayaha",
+                    "title": "Voyayaha curated place",
+                    "description": str(db.get("source") or "Voyayaha database"),
+                    "url": source_url,
+                }],
+                "evidence": str(db.get("description") or "Verified Voyayaha database record."),
+                "themes": [str(db.get("category"))] if db.get("category") else [],
+                "confidence": 1.0,
+                "geocoder_verified": True,
+                "geocoder": "supabase_curated",
+                "geocoder_type": "curated",
+                "source_type": "voyayaha_database",
+                "database_id": db.get("id"),
+                "image_url": db.get("image_url"),
+            })
+
     sources_checked = {"reddit": sum(len(x) for x in reddit_sets), "youtube": sum(len(x) for x in youtube_sets)}
     config = _configuration_status()
     diagnostics = {
@@ -872,6 +933,8 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
         "rejected_generic_names": True,
         "requires_source_evidence": True,
         "requires_geocoder_place_type": True,
+        "curated_database_enabled": config.get("supabase", False),
+        "curated_database_results": len(database_results),
     }
     if not sources:
         message = "No Reddit or YouTube evidence was collected. On Render, add YOUTUBE_API_KEY and REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET."
@@ -881,7 +944,7 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
         message = "Social recommendations verified."
 
     return {
-        "discovery_version": "3.1-global-place-gated",
+        "discovery_version": "3.2-global-place-gated-db",
         "location": location,
         "center": {"latitude": float(center_lat), "longitude": float(center_lon)},
         "radius_km": radius_km,
@@ -890,6 +953,6 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
         "candidates_checked": len(ranked_candidates),
         "diagnostics": diagnostics,
         "message": message,
-        "method": "Reddit + YouTube discovery → AI place extraction → geocoding → 100 km verification → social/recency ranking → AI synthesis",
+        "method": "Reddit + YouTube discovery → AI place extraction → geocoding → 100 km verification → social/recency ranking → AI synthesis → Voyayaha curated database fallback",
         "degraded": not bool(sources),
     }

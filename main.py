@@ -24,6 +24,7 @@ from social import get_youtube_posts, get_reddit_posts
 from voyayaha_hidden_llm import generate_hidden_itinerary
 from voyayaha_hidden_social import get_hidden_social
 from social_discovery import discover_social_places
+from supabase_places import search_curated_places, database_health
 
 load_dotenv()
 
@@ -256,10 +257,47 @@ async def social_discovery_health():
     """Non-secret deployment check for the Hidden Places discovery service."""
     from social_discovery import _configuration_status
     return {
-        "discovery_version": "3.1-global-place-gated",
-        "configuration": _configuration_status(),
+        "discovery_version": "3.2-global-place-gated-db",
+        "configuration": {**_configuration_status(), "supabase": bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY"))},
         "message": "Keys are never returned; booleans only show whether the required environment variables are present.",
     }
+
+@app.get("/database/health")
+async def database_places_health():
+    return await database_health()
+
+@app.get("/api/database/health")
+async def api_database_places_health():
+    return await database_health()
+
+@app.get("/database/places")
+async def database_places(
+    location: str = Query(..., min_length=1),
+    query: str = "",
+    radius_km: float = Query(100, ge=1, le=250),
+    limit: int = Query(3, ge=1, le=3),
+):
+    center = await __import__("asyncio").to_thread(get_lat_lon_from_city, location)
+    if center[0] is None or center[1] is None:
+        return {"location": location, "radius_km": radius_km, "results": [], "message": "Could not locate the main city."}
+    results = await search_curated_places(location, query, radius_km, limit, center)
+    return {
+        "location": location,
+        "center": {"latitude": center[0], "longitude": center[1]},
+        "radius_km": radius_km,
+        "results": results,
+        "count": len(results),
+        "source": "voyayaha_database",
+    }
+
+@app.get("/api/database/places")
+async def api_database_places(
+    location: str = Query(..., min_length=1),
+    query: str = "",
+    radius_km: float = Query(100, ge=1, le=250),
+    limit: int = Query(3, ge=1, le=3),
+):
+    return await database_places(location, query, radius_km, limit)
 
 @app.get("/social-discovery")
 async def social_discovery(
