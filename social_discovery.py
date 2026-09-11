@@ -24,6 +24,14 @@ REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "voyayaha/1.0")
 API_BASE = os.getenv("API_BASE", "https://backend-eqzz.onrender.com").rstrip("/")
 
+
+def _configuration_status() -> dict[str, bool]:
+    return {
+        "youtube_api": bool(YOUTUBE_API_KEY),
+        "reddit_api": bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET),
+        "groq": bool(os.getenv("VY_GROQ_API_KEY") or os.getenv("GROQ_API_KEY")),
+    }
+
 reddit = None
 if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
     try:
@@ -212,26 +220,29 @@ async def _youtube_search(query: str, limit: int = 10, order: str = "relevance")
 
 
 async def _geocode(name: str, city: str) -> tuple[float | None, float | None]:
-    """Geocode a candidate place without requiring a paid maps API.
+    """Geocode a candidate and prefer results actually near the requested city.
 
-    We try several increasingly broad queries because landmarks such as
-    "Marine Drive" or "Devkund" often do not resolve when the city is
-    appended as one long Open-Meteo name query.
+    Landmark names are often ambiguous (for example "Waterfall" or "Fort"), so
+    never accept the first India-wide hit blindly. We score returned results by
+    city-name match and distance from the city centre.
     """
     queries = [
+        f"{name}, {city}, Maharashtra, India" if city.lower() in {"mumbai", "pune", "thane", "nashik", "nagpur"} else f"{name}, {city}, India",
         f"{name}, {city}, India",
         f"{name}, {city}",
         f"{name}, India",
-        name,
     ]
 
-    # Open-Meteo is fast and free. Try each query and keep the first useful hit.
+    city_lat, city_lon = await asyncio.to_thread(get_lat_lon_from_city, city)
+
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
+            best: tuple[float, float, float] | None = None
             for q in queries:
                 r = await client.get(
                     "https://geocoding-api.open-meteo.com/v1/search",
-                    params={"name": q, "count": 5, "language": "en", "format": "json"},
+                    params={"name": q, "count": 10, "language": "en", "format": "json"},
                 )
                 if not r.is_success:
                     continue
@@ -239,26 +250,46 @@ async def _geocode(name: str, city: str) -> tuple[float | None, float | None]:
                     lat, lon = row.get("latitude"), row.get("longitude")
                     if lat is None or lon is None:
                         continue
-                    # Prefer a result in the requested city/country when the API provides metadata.
-                    country = str(row.get("country_code", "")).lower()
-                    if country in {"in", "india"} or city.lower() in str(row).lower():
-                        return float(lat), float(lon)
+                    country = str(row.get("country_code", row.get("country", ""))).lower()
+                    if country not in {"in", "india"} and "india" not in str(row).lower():
+                        continue
+                    d = _distance_km(city_lat, city_lon, float(lat), float(lon)) if city_lat is not None and city_lon is not None else 99999.0
+                    text = str(row).lower()
+                    city_match = 0 if city.lower() in text else 1
+                    candidate = (city_match, d, float(lat), float(lon))
+                    if best is None or candidate[:2] < best[:2]:
+                        best = candidate
+            if best is not None:
+                # Do not accept an obviously unrelated India-wide result when a city
+                # centre is known. The final radius check remains authoritative.
+                if city_lat is None or city_lon is None or best[1] <= 250:
+                    return best[2], best[3]
     except Exception:
         pass
 
-    # Nominatim is the fallback. Keep the request count low and use a descriptive user agent.
     try:
         async with httpx.AsyncClient(timeout=12, headers={"User-Agent": "Voyayaha/1.0 (travel discovery)"}) as client:
+            best: tuple[float, float, float] | None = None
             for q in queries[:3]:
                 r = await client.get(
                     "https://nominatim.openstreetmap.org/search",
-                    params={"q": q, "format": "json", "limit": 3, "countrycodes": "in"},
+                    params={"q": q, "format": "json", "limit": 8, "countrycodes": "in"},
                 )
                 if not r.is_success:
                     continue
-                rows = r.json()
-                if rows:
-                    return float(rows[0]["lat"]), float(rows[0]["lon"])
+                for row in r.json():
+                    try:
+                        lat, lon = float(row["lat"]), float(row["lon"])
+                    except Exception:
+                        continue
+                    d = _distance_km(city_lat, city_lon, lat, lon) if city_lat is not None and city_lon is not None else 99999.0
+                    text = str(row).lower()
+                    city_match = 0 if city.lower() in text else 1
+                    candidate = (city_match, d, lat, lon)
+                    if best is None or candidate[:2] < best[:2]:
+                        best = candidate
+            if best is not None and (city_lat is None or city_lon is None or best[1] <= 250):
+                return best[2], best[3]
     except Exception as exc:
         print("Candidate geocoding error:", name, repr(exc))
     return None, None
@@ -501,6 +532,24 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
             if len(candidates) >= 15:
                 break
 
+    # Some LLM responses omit source_indexes. Recover them deterministically by
+    # matching the candidate name against the actual source text. This prevents a
+    # valid place from being discarded merely because the model omitted metadata.
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        idxs = candidate.get("source_indexes")
+        if not isinstance(idxs, list) or not idxs:
+            name = _clean_text(candidate.get("name", ""), 180).lower()
+            if name:
+                tokens = [t for t in re.findall(r"[a-z0-9]+", name) if len(t) >= 3]
+                matches = []
+                for si, src in enumerate(sources):
+                    text = " ".join([str(src.get("title", "")), str(src.get("description", "")), " ".join(src.get("comments", []) if isinstance(src.get("comments"), list) else [])]).lower()
+                    if name in text or (tokens and sum(t in text for t in tokens) >= max(1, len(tokens) - 1)):
+                        matches.append(si)
+                candidate["source_indexes"] = matches[:10]
+
     prepared: list[dict[str, Any]] = []
     sem = asyncio.Semaphore(3)
 
@@ -567,7 +616,7 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
         key = re.sub(r"[^a-z0-9]", "", row["name"].lower())
         if key not in unique or row["social_score"] > unique[key]["social_score"]:
             unique[key] = row
-    ranked_candidates = sorted(unique.values(), key=lambda x: (-x["social_score"], x["distance_km"]))[:8]
+    ranked_candidates = sorted(unique.values(), key=lambda x: (-x["social_score"], x["distance_km"]))[:15]
 
     synthesis = await _synthesize_ranked_places(location, interest, ranked_candidates, sources, radius_km)
     by_index = {i: c for i, c in enumerate(ranked_candidates)}
@@ -644,13 +693,30 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
                 "ai_confidence": base["confidence"],
             })
 
+    sources_checked = {"reddit": sum(len(x) for x in reddit_sets), "youtube": sum(len(x) for x in youtube_sets)}
+    config = _configuration_status()
+    diagnostics = {
+        "configuration": config,
+        "sources_collected": len(sources),
+        "candidates_extracted": len(candidates),
+        "geographically_verified": len(ranked_candidates),
+    }
+    if not sources:
+        message = "No Reddit or YouTube evidence was collected. On Render, add YOUTUBE_API_KEY and REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET."
+    elif len(ranked_candidates) < limit:
+        message = f"Only {len(ranked_candidates)} social places could be geographically verified within {radius_km:g} km of {location}."
+    else:
+        message = "Social recommendations verified."
+
     return {
         "location": location,
         "center": {"latitude": float(center_lat), "longitude": float(center_lon)},
         "radius_km": radius_km,
         "results": final[:limit],
-        "sources_checked": {"reddit": sum(len(x) for x in reddit_sets), "youtube": sum(len(x) for x in youtube_sets)},
+        "sources_checked": sources_checked,
         "candidates_checked": len(ranked_candidates),
+        "diagnostics": diagnostics,
+        "message": message,
         "method": "Reddit + YouTube discovery → AI place extraction → geocoding → 100 km verification → social/recency ranking → AI synthesis",
         "degraded": not bool(sources),
     }
