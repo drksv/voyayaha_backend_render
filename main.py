@@ -251,6 +251,16 @@ async def hidden_experiences_alias(location: str, query: str = "", limit: int = 
 async def social_hidden(location: str = "Mumbai", query: str = "", limit: int = Query(3, ge=1, le=10)):
     return await _safe_await(get_hidden_social(location, query, limit), [])
 
+@app.get("/social-discovery/health")
+async def social_discovery_health():
+    """Non-secret deployment check for the Hidden Places discovery service."""
+    from social_discovery import _configuration_status
+    return {
+        "discovery_version": "3.0-place-gated",
+        "configuration": _configuration_status(),
+        "message": "Keys are never returned; booleans only show whether the required environment variables are present.",
+    }
+
 @app.get("/social-discovery")
 async def social_discovery(
     location: str = Query(..., min_length=1),

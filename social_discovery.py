@@ -219,26 +219,65 @@ async def _youtube_search(query: str, limit: int = 10, order: str = "relevance")
         return []
 
 
-async def _geocode(name: str, city: str) -> tuple[float | None, float | None]:
-    """Geocode a candidate and prefer results actually near the requested city.
+async def _geocode(name: str, city: str) -> tuple[float | None, float | None, dict[str, Any]]:
+    """Geocode a candidate and return coordinates plus evidence that it is a place.
 
-    Landmark names are often ambiguous (for example "Waterfall" or "Fort"), so
-    never accept the first India-wide hit blindly. We score returned results by
-    city-name match and distance from the city centre.
+    A coordinate alone is NOT enough. Generic English words can sometimes be
+    returned by geocoders as business/locality names. We therefore keep the
+    geocoder class/type/feature code and apply a second deterministic place gate.
     """
     queries = [
         f"{name}, {city}, Maharashtra, India" if city.lower() in {"mumbai", "pune", "thane", "nashik", "nagpur"} else f"{name}, {city}, India",
         f"{name}, {city}, India",
         f"{name}, {city}",
-        f"{name}, India",
     ]
-
     city_lat, city_lon = await asyncio.to_thread(get_lat_lon_from_city, city)
 
+    # Nominatim gives class/type information, which is much better for rejecting
+    # English words than coordinates alone.
+    try:
+        async with httpx.AsyncClient(timeout=12, headers={"User-Agent": "Voyayaha/1.0 (travel discovery)"}) as client:
+            best = None
+            for q in queries:
+                r = await client.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": q, "format": "json", "limit": 8, "countrycodes": "in", "addressdetails": 1},
+                )
+                if not r.is_success:
+                    continue
+                for row in r.json():
+                    try:
+                        lat, lon = float(row["lat"]), float(row["lon"])
+                    except Exception:
+                        continue
+                    display = str(row.get("display_name", ""))
+                    d = _distance_km(city_lat, city_lon, lat, lon) if city_lat is not None and city_lon is not None else 99999.0
+                    cls = str(row.get("class", "")).lower()
+                    typ = str(row.get("type", "")).lower()
+                    address = row.get("address", {}) if isinstance(row.get("address"), dict) else {}
+                    name_part = str(row.get("name", ""))
+                    geographic = (
+                        cls in {"place", "natural", "tourism", "leisure", "historic", "waterway", "boundary", "landuse"}
+                        or typ in {"city", "town", "village", "hamlet", "suburb", "neighbourhood", "island", "peak", "waterfall", "beach", "lake", "river", "valley", "hill", "mountain", "cave", "fort", "castle", "palace", "temple", "park", "nature_reserve", "viewpoint", "reservoir", "dam", "trail", "protected_area"}
+                    )
+                    city_match = 0 if city.lower() in display.lower() else 1
+                    exactish = name.lower().strip() == name_part.lower().strip() or name.lower().strip() in display.lower()
+                    if not geographic or not exactish:
+                        continue
+                    candidate = (city_match, d, lat, lon, {"geocoder": "nominatim", "class": cls, "type": typ, "display_name": display, "name": name_part, "address": address})
+                    if best is None or candidate[:2] < best[:2]:
+                        best = candidate
+            if best is not None and (city_lat is None or city_lon is None or best[1] <= 250):
+                return best[2], best[3], best[4]
+    except Exception as exc:
+        print("Nominatim candidate geocoding error:", name, repr(exc))
 
+    # Open-Meteo fallback. Feature codes beginning PPL are populated places;
+    # natural/tourism feature codes are also accepted when the returned name is
+    # an exact/near-exact match.
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            best: tuple[float, float, float] | None = None
+            best = None
             for q in queries:
                 r = await client.get(
                     "https://geocoding-api.open-meteo.com/v1/search",
@@ -253,46 +292,23 @@ async def _geocode(name: str, city: str) -> tuple[float | None, float | None]:
                     country = str(row.get("country_code", row.get("country", ""))).lower()
                     if country not in {"in", "india"} and "india" not in str(row).lower():
                         continue
+                    returned_name = str(row.get("name", ""))
+                    feature = str(row.get("feature_code", "")).upper()
                     d = _distance_km(city_lat, city_lon, float(lat), float(lon)) if city_lat is not None and city_lon is not None else 99999.0
-                    text = str(row).lower()
-                    city_match = 0 if city.lower() in text else 1
-                    candidate = (city_match, d, float(lat), float(lon))
-                    if best is None or candidate[:2] < best[:2]:
-                        best = candidate
-            if best is not None:
-                # Do not accept an obviously unrelated India-wide result when a city
-                # centre is known. The final radius check remains authoritative.
-                if city_lat is None or city_lon is None or best[1] <= 250:
-                    return best[2], best[3]
-    except Exception:
-        pass
-
-    try:
-        async with httpx.AsyncClient(timeout=12, headers={"User-Agent": "Voyayaha/1.0 (travel discovery)"}) as client:
-            best: tuple[float, float, float] | None = None
-            for q in queries[:3]:
-                r = await client.get(
-                    "https://nominatim.openstreetmap.org/search",
-                    params={"q": q, "format": "json", "limit": 8, "countrycodes": "in"},
-                )
-                if not r.is_success:
-                    continue
-                for row in r.json():
-                    try:
-                        lat, lon = float(row["lat"]), float(row["lon"])
-                    except Exception:
+                    exactish = name.lower().strip() == returned_name.lower().strip() or name.lower().strip() in returned_name.lower()
+                    geographic = feature.startswith("PPL") or feature.startswith(("MT", "LK", "STM", "RST", "CST", "PK", "HTL"))
+                    if not exactish or not geographic:
                         continue
-                    d = _distance_km(city_lat, city_lon, lat, lon) if city_lat is not None and city_lon is not None else 99999.0
                     text = str(row).lower()
                     city_match = 0 if city.lower() in text else 1
-                    candidate = (city_match, d, lat, lon)
+                    candidate = (city_match, d, float(lat), float(lon), {"geocoder": "open-meteo", "feature_code": feature, "name": returned_name, "display_name": text})
                     if best is None or candidate[:2] < best[:2]:
                         best = candidate
             if best is not None and (city_lat is None or city_lon is None or best[1] <= 250):
-                return best[2], best[3]
+                return best[2], best[3], best[4]
     except Exception as exc:
-        print("Candidate geocoding error:", name, repr(exc))
-    return None, None
+        print("Open-Meteo candidate geocoding error:", name, repr(exc))
+    return None, None, {}
 
 
 # Words that frequently get mistaken for place names when an LLM or a
@@ -300,7 +316,10 @@ async def _geocode(name: str, city: str) -> tuple[float | None, float | None]:
 # never accepted as destinations, even if a geocoder happens to find an unrelated
 # geographic feature with the same name.
 GENERIC_NON_PLACE_NAMES = {
-    "what", "why", "where", "when", "which", "who", "how", "please",
+    # Question / conversational words that must never be surfaced as places.
+    "what", "why", "where", "when", "which", "who", "how", "please", "welcome",
+    "dont", "don't", "doesnt", "doesn't", "cant", "can't", "wont", "won't",
+    "isnt", "isn't", "wasnt", "wasn't", "shouldnt", "shouldn't", "couldnt", "couldn't",
     "help", "thanks", "thank", "hello", "hi", "hey", "anyone", "someone",
     "people", "person", "guys", "everyone", "recommend", "recommendations",
     "suggestion", "suggestions", "advice", "question", "questions", "guide",
@@ -312,6 +331,10 @@ GENERIC_NON_PLACE_NAMES = {
     "awesome", "good", "great", "near", "around", "from", "with", "without", "the",
     "this", "that", "these", "those", "here", "there", "today", "tomorrow", "yesterday",
     "2024", "2025", "2026", "2027", "official", "channel", "comment", "comments",
+    "welcome", "dont", "doesnt", "cant", "wont", "isnt", "wasnt", "shouldnt", "couldnt",
+    "check", "click", "subscribe", "follow", "like", "share", "watch", "video",
+    "part", "episode", "ep", "day", "days", "time", "times", "way", "ways",
+    "one", "two", "three", "first", "second", "third", "new", "old", "home",
 }
 
 
@@ -337,6 +360,44 @@ def _is_obviously_not_a_place(name: str, city: str = "") -> bool:
     return False
 
 
+PLACE_CONTEXT_WORDS = {
+    "waterfall", "falls", "fort", "village", "beach", "lake", "river", "dam", "trail",
+    "trek", "trekking", "hill", "hills", "mountain", "peak", "valley", "cave",
+    "temple", "church", "mosque", "monastery", "sanctuary", "reserve", "forest",
+    "park", "viewpoint", "point", "island", "islands", "island", "backwater",
+    "lagoon", "wadi", "ghat", "pass", "reservoir", "fort", "forts", "palace",
+    "museum", "garden", "gardens", "village", "villages", "town", "township",
+    "beaches", "waterfalls", "trails", "caves", "temples", "churches", "lake",
+}
+
+
+def _source_has_geographic_context(name: str, source_indexes: list[Any], sources: list[dict[str, Any]]) -> bool:
+    """Require a one-word candidate to have geographic context in the source text.
+
+    This blocks common English words such as 'Welcome' or 'Dont' even when an
+    LLM extracts them from a sentence. Multi-word names still require exact
+    source evidence, while one-word names need either a recognizable geographic
+    cue or a geocoder-confirmed populated place.
+    """
+    if len(re.findall(r"[A-Za-z0-9]+", name)) > 1:
+        return True
+    pattern = re.compile(r"\b" + re.escape(name.lower()) + r"\b")
+    for idx in source_indexes:
+        if not isinstance(idx, int) or idx < 0 or idx >= len(sources):
+            continue
+        src = sources[idx]
+        text = " ".join([
+            str(src.get("title", "")),
+            str(src.get("description", "")),
+            " ".join(src.get("comments", []) if isinstance(src.get("comments"), list) else []),
+        ]).lower()
+        for m in pattern.finditer(text):
+            window = text[max(0, m.start() - 100): min(len(text), m.end() + 100)]
+            if any(re.search(r"\b" + re.escape(cue) + r"\b", window) for cue in PLACE_CONTEXT_WORDS):
+                return True
+    return False
+
+
 def _candidate_has_place_evidence(name: str, source_indexes: list[Any], sources: list[dict[str, Any]]) -> bool:
     """Require the exact candidate to occur in actual source text.
 
@@ -357,7 +418,8 @@ def _candidate_has_place_evidence(name: str, source_indexes: list[Any], sources:
             str(src.get("description", "")),
             " ".join(src.get("comments", []) if isinstance(src.get("comments"), list) else []),
         ]).lower()
-        if name_norm in re.sub(r"\s+", " ", text):
+        normalized_text = re.sub(r"\s+", " ", text)
+        if name_norm in normalized_text:
             return True
     return False
 
@@ -570,6 +632,7 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
     center_lat, center_lon = await asyncio.to_thread(get_lat_lon_from_city, location)
     if center_lat is None or center_lon is None:
         return {
+            "discovery_version": "3.0-place-gated",
             "location": location,
             "radius_km": radius_km,
             "results": [],
@@ -654,9 +717,18 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
         if not _candidate_has_place_evidence(name, idxs0, sources):
             return None
         async with sem:
-            lat, lon = await _geocode(name, location)
+            lat, lon, geo_meta = await _geocode(name, location)
         if lat is None or lon is None:
             return None
+        if len(re.findall(r"[A-Za-z0-9]+", name)) == 1 and not _source_has_geographic_context(name, idxs0, sources):
+            # Single-word destinations such as Lonavala are legitimate, but a
+            # plain English word is not. Allow the former only when the geocoder
+            # independently classifies it as a populated geographic place.
+            geo_type = str(geo_meta.get("type", "")).lower()
+            geo_feature = str(geo_meta.get("feature_code", "")).upper()
+            allowed_single = geo_type in {"city", "town", "village", "hamlet", "suburb", "neighbourhood", "island", "peak", "waterfall", "beach", "lake", "river", "valley", "hill", "mountain", "cave", "fort", "castle", "palace", "temple", "park", "nature_reserve", "viewpoint", "reservoir", "dam"} or geo_feature.startswith("PPL")
+            if not allowed_single:
+                return None
         distance = _distance_km(float(center_lat), float(center_lon), lat, lon)
         if distance > radius_km:
             return None
@@ -702,6 +774,9 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
             "evidence": _clean_text(candidate.get("evidence", ""), 700),
             "themes": candidate.get("themes", []) if isinstance(candidate.get("themes"), list) else [],
             "confidence": confidence,
+            "geocoder_verified": True,
+            "geocoder": geo_meta.get("geocoder", ""),
+            "geocoder_type": geo_meta.get("type", geo_meta.get("feature_code", "")),
         }
 
     prepared = [x for x in await asyncio.gather(*(prepare(c) for c in candidates[:15])) if x]
@@ -796,6 +871,9 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
         "sources_collected": len(sources),
         "candidates_extracted": len(candidates),
         "geographically_verified": len(ranked_candidates),
+        "rejected_generic_names": True,
+        "requires_source_evidence": True,
+        "requires_geocoder_place_type": True,
     }
     if not sources:
         message = "No Reddit or YouTube evidence was collected. On Render, add YOUTUBE_API_KEY and REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET."
@@ -805,6 +883,7 @@ async def discover_social_places(location: str, query: str = "", radius_km: floa
         message = "Social recommendations verified."
 
     return {
+        "discovery_version": "3.0-place-gated",
         "location": location,
         "center": {"latitude": float(center_lat), "longitude": float(center_lon)},
         "radius_km": radius_km,
