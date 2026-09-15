@@ -333,6 +333,12 @@ GENERIC_NON_PLACE_NAMES = {
     "check", "click", "subscribe", "follow", "like", "share", "watch", "video",
     "part", "episode", "ep", "day", "days", "time", "times", "way", "ways",
     "one", "two", "three", "first", "second", "third", "new", "old", "home",
+    # Calendar words frequently appear in social-media titles and captions and
+    # must never be interpreted as destination names (e.g. "August travel").
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "spring", "summer", "autumn", "fall", "winter", "season", "seasons",
 }
 
 
