@@ -35,6 +35,8 @@ app = FastAPI(title="Voyayaha Travel API", version=APP_VERSION)
 # CORS_ORIGINS (comma separated). Wildcard is only used when explicitly set.
 DEFAULT_ORIGINS = [
     "http://localhost:5173",
+    "http://localhost:8080",
+    "http://10.0.0.183:8080",
     "http://127.0.0.1:5173",
     "http://localhost:4173",
     "http://127.0.0.1:4173",
