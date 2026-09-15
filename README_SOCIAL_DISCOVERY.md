@@ -26,3 +26,11 @@ For the full social feature, you need:
 No separate paid geocoding API is required. The implementation uses Open-Meteo geocoding first and Nominatim as a fallback. These public services can rate-limit; the application degrades gracefully.
 
 The LLM receives search evidence, not arbitrary URLs, and is instructed to only extract places actually present in that evidence. Geographic distance is calculated by the backend, not by the LLM.
+
+## UI behavior in this release
+
+The Hidden Places page calls only `/social-discovery` for search results. It no longer renders the legacy raw Reddit/YouTube search grid or the static `Places to explore` grid on the Hidden Places page.
+
+For a city such as `Pune`, or a request such as `peaceful places in Mumbai`, the frontend asks for `limit=3` and renders the three highest-ranked geographically verified places. Supporting Reddit/YouTube links remain inside each place card under `See supporting evidence`.
+
+The backend also supplements a short LLM candidate list with conservative source-text extraction, retries candidate geocoding with several query forms, and fills missing synthesis slots from the already verified ranked candidates. It never labels a raw social URL as a place recommendation.
