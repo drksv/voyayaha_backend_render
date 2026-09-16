@@ -36,8 +36,6 @@ app = FastAPI(title="Voyayaha Travel API", version=APP_VERSION)
 DEFAULT_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "http://localhost:8080",
-    "http://10.0.0.183:8080",
     "http://localhost:4173",
     "http://127.0.0.1:4173",
     "https://voyayaha.com",
@@ -370,6 +368,56 @@ async def proxy_image(url: str):
         raise HTTPException(status_code=404, detail="Image unavailable")
 
 # ---------- WordPress travel memory proxy ----------
+def _wordpress_base() -> str:
+    return os.getenv("VOYAYAHA_WORDPRESS_URL", "https://voyayaha.com").rstrip("/")
+
+def _wordpress_verify_tls() -> bool:
+    # The current voyayaha.com hosting certificate can fail validation from
+    # non-browser clients. Keep this configurable and default to False for
+    # the Render server-to-server proxy.
+    return os.getenv("VOYAYAHA_WORDPRESS_VERIFY_TLS", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+def _wordpress_headers() -> dict[str, str]:
+    return {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+        "Referer": "https://voyayaha.com/",
+    }
+
+@app.get("/travel-memories")
+async def travel_memories_proxy(per_page: int = Query(100, ge=1, le=100)):
+    endpoint = f"{_wordpress_base()}/wp-json/voyayaha/v1/travel-memory?per_page={per_page}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=45,
+            follow_redirects=True,
+            verify=_wordpress_verify_tls(),
+            http2=False,
+            headers=_wordpress_headers(),
+        ) as client:
+            response = await client.get(endpoint)
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {"message": response.text}
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code, detail=payload)
+        return payload
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print("WordPress Travel Memories GET proxy error:", repr(exc))
+        raise HTTPException(
+            status_code=502,
+            detail="WordPress Travel Memories API could not be reached from Render.",
+        )
+
+@app.get("/api/travel-memories")
+async def api_travel_memories_proxy(per_page: int = Query(100, ge=1, le=100)):
+    return await travel_memories_proxy(per_page)
+
 @app.post("/travel-memory")
 async def travel_memory_proxy(
     title: str = Form(...), location: str = Form(...),
@@ -377,17 +425,35 @@ async def travel_memory_proxy(
     date: str = Form(""), description: str = Form(""),
     photo: Optional[UploadFile] = File(None),
 ):
-    wordpress_base = os.getenv("VOYAYAHA_WORDPRESS_URL", "https://voyayaha.com").rstrip("/")
-    endpoint = f"{wordpress_base}/wp-json/voyayaha/v1/travel-memory"
-    data = {"title": title, "location": location, "latitude": str(latitude), "longitude": str(longitude), "date": date, "description": description}
+    endpoint = f"{_wordpress_base()}/wp-json/voyayaha/v1/travel-memory"
+    data = {
+        "title": title,
+        "location": location,
+        "latitude": str(latitude),
+        "longitude": str(longitude),
+        "date": date,
+        "description": description,
+    }
     files = None
     if photo:
         contents = await photo.read()
         if len(contents) > 5 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="Photo is larger than 5 MB.")
-        files = {"photo": (photo.filename or "travel-memory.jpg", contents, photo.content_type or "application/octet-stream")}
+        files = {
+            "photo": (
+                photo.filename or "travel-memory.jpg",
+                contents,
+                photo.content_type or "application/octet-stream",
+            )
+        }
     try:
-        async with httpx.AsyncClient(timeout=45, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=60,
+            follow_redirects=True,
+            verify=_wordpress_verify_tls(),
+            http2=False,
+            headers=_wordpress_headers(),
+        ) as client:
             response = await client.post(endpoint, data=data, files=files)
         try:
             payload = response.json()
@@ -399,5 +465,19 @@ async def travel_memory_proxy(
     except HTTPException:
         raise
     except Exception as exc:
-        print("WordPress proxy error:", repr(exc))
-        raise HTTPException(status_code=502, detail="WordPress Travel Memory API could not be reached from Render.")
+        print("WordPress Travel Memory POST proxy error:", repr(exc))
+        raise HTTPException(
+            status_code=502,
+            detail="WordPress Travel Memory API could not be reached from Render.",
+        )
+
+@app.post("/api/travel-memory")
+async def api_travel_memory_proxy(
+    title: str = Form(...), location: str = Form(...),
+    latitude: float = Form(...), longitude: float = Form(...),
+    date: str = Form(""), description: str = Form(""),
+    photo: Optional[UploadFile] = File(None),
+):
+    return await travel_memory_proxy(
+        title, location, latitude, longitude, date, description, photo
+    )
